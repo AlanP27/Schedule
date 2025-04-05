@@ -1,0 +1,610 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>北二區智能排班系統 - Pro版</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 20px; padding-bottom: 180px; }
+    table { border-collapse: collapse; margin: 20px 0; width: 100%; }
+    th, td { border: 1px solid #ddd; padding: 12px; text-align: center; min-width: 80px; }
+    th { background-color: #f8f9fa; }
+    .early { background-color: #a3d8ff; }
+    .late { background-color: #ffe08c; }
+    .off { background-color: #ffb3ba; }
+    .night { background-color: #6b7280; color: white; }
+    button { padding: 8px 16px; margin: 5px; cursor: pointer; }
+    .toolbar { margin: 15px 0; border-bottom: 2px solid #eee; padding-bottom: 15px; }
+    th:first-child, td:first-child { position: sticky; left: 0; z-index: 2; background: #f8f9fa; min-width: 120px; }
+    th:first-child { z-index: 3; }
+    thead th { position: sticky; top: 0; z-index: 1; background: #f8f9fa; }
+    #calendar { margin-bottom: 180px; }
+    #warnings { position: fixed; bottom: 0; left: 0; width: 100%; background: #fff; border-top: 2px solid #eee; padding: 10px; z-index: 999; max-height: 150px; overflow-y: auto; }
+    .warning { color: red; font-weight: bold; margin: 10px 0; }
+    #dashboard { display: grid; grid-template-columns: 2fr 1fr; gap: 20px; margin-top: 30px; }
+    #shiftChart { max-height: 300px; }
+    .stats table { width: 100%; border-collapse: collapse; }
+    .stats th, .stats td { border: 1px solid #ddd; padding: 8px; }
+    .tooltip { position: absolute; background: #333; color: white; padding: 5px; border-radius: 3px; font-size: 12px; pointer-events: none; }
+  </style>
+</head>
+<body>
+  <h1>北二區智能排班系統 - Pro版</h1>
+  <div class="toolbar">
+    <label>年份：<input type="number" id="year" value="2025" min="2000" max="2100"></label>
+    <label>月份：<input type="number" id="month" value="2" min="1" max="12"></label>
+    <label>週數：<input type="number" id="weeks" value="5" min="1" max="10"></label>
+    <label>每日需求：<input type="number" id="minEarly" value="1" min="0" style="width:40px"> 早班
+                  <input type="number" id="minLate" value="1" min="0" style="width:40px"> 晚班</label>
+    <button onclick="adjustWeeks('front')">前調週數</button>
+    <button onclick="adjustWeeks('back')">後調週數</button>
+    <button onclick="generateSchedule()">生成表格</button>
+    <button onclick="autoFill()">智能排班</button>
+    <button onclick="exportToExcel()">導出Excel</button>
+    <button onclick="resetAll()">重置全部</button>
+    <input type="file" id="importFile" accept=".xlsx" style="display: none;" onchange="importSchedule(event)">
+    <button onclick="document.getElementById('importFile').click()">匯入Excel</button>
+    <button onclick="togglePrioritySettings()">員工優先級設定</button>
+  </div>
+  <div id="prioritySettings" style="display: none; position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); background: #fff; padding: 20px; border: 1px solid #ddd; z-index: 1000;">
+    <h3>員工優先級設定</h3>
+    <table id="priorityTable">
+      <thead><tr><th>員工</th><th>最大班次</th><th>偏好班次</th></tr></thead>
+      <tbody></tbody>
+    </table>
+    <button onclick="savePrioritySettings()" style="margin-top: 10px;">保存設定</button>
+    <button onclick="togglePrioritySettings()" style="margin-top: 10px;">關閉</button>
+  </div>
+  <h2 id="monthTitle"></h2>
+  <div id="calendar"></div>
+  <div id="warnings"></div>
+  <div id="dashboard">
+    <div class="chart-container">
+      <h3>班次分布圖</h3>
+      <canvas id="shiftChart"></canvas>
+    </div>
+    <div class="stats">
+      <h3>員工工時統計</h3>
+      <table id="employeeStats"></table>
+    </div>
+  </div>
+
+  <script src="https://cdn.sheetjs.com/xlsx-0.20.0/package/dist/xlsx.full.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <script>
+    const EMPLOYEES = ["王俊凱", "蔡鎮宇", "戴振杰", "楊勛凱", "張智宇", "賴柏仁"];
+    const SHIFT_TYPES = { OFF: "休", NIGHT: "夜", EARLY: "早", LATE: "晚" };
+    const SHIFT_ORDER = ["", SHIFT_TYPES.OFF, SHIFT_TYPES.NIGHT, SHIFT_TYPES.EARLY, SHIFT_TYPES.LATE];
+    let EMPLOYEE_PRIORITY = {
+      "王俊凱": { maxShifts: 22, prefer: '' },
+      "蔡鎮宇": { maxShifts: 22, prefer: '' },
+      "戴振杰": { maxShifts: 22, prefer: '' },
+      "楊勛凱": { maxShifts: 22, prefer: '' },
+      "張智宇": { maxShifts: 22, prefer: '' },
+      "賴柏仁": { maxShifts: 22, prefer: '' }
+    };
+    let schedule = {};
+    let weekOffset = 0;
+    let startDate;
+    let shiftChart;
+    let globalWarnings = [];
+
+    function getAllowedShifts(prevShift) {
+      if (!prevShift) return [SHIFT_TYPES.OFF, SHIFT_TYPES.NIGHT, SHIFT_TYPES.EARLY, SHIFT_TYPES.LATE];
+      switch (prevShift) {
+        case SHIFT_TYPES.OFF: return [SHIFT_TYPES.OFF, SHIFT_TYPES.NIGHT, SHIFT_TYPES.EARLY, SHIFT_TYPES.LATE];
+        case SHIFT_TYPES.NIGHT: return [SHIFT_TYPES.OFF, SHIFT_TYPES.NIGHT];
+        case SHIFT_TYPES.EARLY: return [SHIFT_TYPES.OFF, SHIFT_TYPES.NIGHT, SHIFT_TYPES.EARLY, SHIFT_TYPES.LATE];
+        case SHIFT_TYPES.LATE: return [SHIFT_TYPES.OFF, SHIFT_TYPES.LATE];
+        default: return [SHIFT_TYPES.OFF, SHIFT_TYPES.NIGHT, SHIFT_TYPES.EARLY, SHIFT_TYPES.LATE];
+      }
+    }
+
+    function adjustWeeks(direction) {
+      if (direction === 'front') weekOffset--;
+      else if (direction === 'back') weekOffset++;
+      generateSchedule();
+      saveState();
+    }
+
+    function generateSchedule() {
+      const year = parseInt(document.getElementById('year').value);
+      const month = parseInt(document.getElementById('month').value) - 1;
+      const weeks = parseInt(document.getElementById('weeks').value);
+
+      const savedData = localStorage.getItem('scheduleData');
+      const savedConfig = JSON.parse(localStorage.getItem('systemConfig') || '{}');
+      const savedPriority = localStorage.getItem('employeePriority');
+
+      if (savedData && savedConfig && savedConfig.year === year && savedConfig.month === month + 1 && savedConfig.weeks === weeks) {
+        if (savedPriority) EMPLOYEE_PRIORITY = JSON.parse(savedPriority);
+        schedule = JSON.parse(savedData);
+        startDate = new Date(year, month, 1);
+        startDate.setDate(startDate.getDate() - startDate.getDay() + weekOffset * 7);
+        renderCalendar(schedule[EMPLOYEES[0]].length - 1);
+        updateDashboard();
+        return;
+      }
+
+      const firstDay = new Date(year, month, 1);
+      const dayOfWeek = firstDay.getDay();
+      startDate = new Date(firstDay);
+      startDate.setDate(firstDay.getDate() - dayOfWeek + weekOffset * 7);
+      const totalDays = weeks * 7;
+      document.getElementById('monthTitle').textContent = `${year}年${month + 1}月排班表 (共${totalDays}天，從${startDate.getMonth() + 1}/${startDate.getDate()}開始)`;
+      schedule = {};
+      EMPLOYEES.forEach(emp => schedule[emp] = Array(totalDays + 1).fill(''));
+      renderCalendar(totalDays);
+      saveState();
+    }
+
+    function renderCalendar(totalDays) {
+      let html = "<table><thead><tr><th rowspan='2'>員工\\日期</th>";
+      let isLightGray = true;
+      for (let w = 0; w < parseInt(document.getElementById('weeks').value); w++) {
+        let bgColor = isLightGray ? "#ddd" : "#bbb";
+        html += `<th colspan="7" style="background-color: ${bgColor};">第 ${w + 1} 週</th>`;
+        isLightGray = !isLightGray;
+      }
+      html += "</tr><tr>";
+      for (let d = 0; d < totalDays; d++) {
+        const currentDate = new Date(startDate);
+        currentDate.setDate(startDate.getDate() + d);
+        const weekIndex = Math.floor(d / 7);
+        let bgColor = (weekIndex % 2 === 0) ? "#ddd" : "#bbb";
+        html += `<th style="background-color: ${bgColor};">${currentDate.getMonth() + 1}/${currentDate.getDate()}<br>${['日','一','二','三','四','五','六'][currentDate.getDay()]}</th>`;
+      }
+      html += "</tr></thead><tbody>";
+      EMPLOYEES.forEach(emp => {
+        html += `<tr><td>${emp}</td>`;
+        for (let d = 1; d <= totalDays; d++) {
+          const shift = schedule[emp][d];
+          html += `<td class="${getShiftClass(shift)}" onclick="toggleShift('${emp}', ${d})" oncontextmenu="clearShift(event, '${emp}', ${d})" onmouseover="showShiftTooltip(event, '${emp}', ${d})">${formatShift(shift)}</td>`;
+        }
+        html += "</tr>";
+      });
+      html += "</tbody></table>";
+      document.getElementById('calendar').innerHTML = html;
+      updateDashboard();
+      showWarnings(globalWarnings);
+    }
+
+    function toggleShift(emp, day) {
+      const prevShift = day > 1 ? schedule[emp][day - 1] : '';
+      const allowedShifts = getAllowedShifts(prevShift);
+      const current = schedule[emp][day];
+      let nextIndex = (SHIFT_ORDER.indexOf(current) + 1) % SHIFT_ORDER.length;
+      while (!allowedShifts.includes(SHIFT_ORDER[nextIndex]) && nextIndex !== SHIFT_ORDER.indexOf(current)) {
+        nextIndex = (nextIndex + 1) % SHIFT_ORDER.length;
+      }
+      schedule[emp][day] = SHIFT_ORDER[nextIndex];
+      renderCalendar(schedule[EMPLOYEES[0]].length - 1);
+      const totalDays = schedule[EMPLOYEES[0]].length - 1;
+      globalWarnings = [];
+      validateSchedule(totalDays, globalWarnings);
+      saveState();
+    }
+
+    function clearShift(event, emp, day) {
+      event.preventDefault();
+      schedule[emp][day] = '';
+      renderCalendar(schedule[EMPLOYEES[0]].length - 1);
+      const totalDays = schedule[EMPLOYEES[0]].length - 1;
+      globalWarnings = [];
+      validateSchedule(totalDays, globalWarnings);
+      saveState();
+    }
+
+    function preAssignOffDays(totalDays) {
+      const weeks = parseInt(document.getElementById('weeks').value);
+      const state = EMPLOYEES.reduce((acc, emp) => {
+        acc[emp] = { consecutiveWork: 0, weeklyOff: new Map(), totalWork: 0 };
+        return acc;
+      }, {});
+
+      EMPLOYEES.forEach(emp => {
+        const mandatoryOffDays = new Map();
+        for (let d = 1; d < totalDays; d++) {
+          if (schedule[emp][d] === SHIFT_TYPES.NIGHT) {
+            const week = Math.floor((d - 1) / 7) + 1;
+            const nextDay = d + 1;
+            if (schedule[emp][nextDay] === '' || ![SHIFT_TYPES.NIGHT].includes(schedule[emp][nextDay])) {
+              mandatoryOffDays.set(week, (mandatoryOffDays.get(week) || 0) + 1);
+            }
+          }
+        }
+
+        for (let w = 0; w < weeks; w++) {
+          const weekStart = w * 7 + 1;
+          const weekEnd = Math.min(weekStart + 6, totalDays);
+          const preAssignedOff = Array.from({length: weekEnd - weekStart + 1}, (_, i) => weekStart + i)
+            .filter(d => schedule[emp][d] === SHIFT_TYPES.OFF).length;
+          const mandatoryOff = mandatoryOffDays.get(w + 1) || 0;
+          const totalOff = preAssignedOff + mandatoryOff;
+          const offToAssign = Math.max(2 - totalOff, 0);
+          const availableDays = Array.from({length: weekEnd - weekStart + 1}, (_, i) => weekStart + i)
+            .filter(d => schedule[emp][d] === '' && (d === 1 || schedule[emp][d - 1] !== SHIFT_TYPES.NIGHT));
+          let offCount = 0;
+          while (offCount < offToAssign && availableDays.length > 0) {
+            const randomize = Math.floor(Math.random() * availableDays.length);
+            const offDay = availableDays[randomize];
+            schedule[emp][offDay] = SHIFT_TYPES.OFF;
+            state[emp].weeklyOff.set(w + 1, (state[emp].weeklyOff.get(w + 1) || 0) + 1);
+            offCount++;
+            availableDays.splice(randomize, 1);
+          }
+        }
+      });
+      return state;
+    }
+
+    function autoFill() {
+      const totalDays = schedule[EMPLOYEES[0]].length - 1;
+      const minEarly = parseInt(document.getElementById('minEarly').value);
+      const minLate = parseInt(document.getElementById('minLate').value);
+      globalWarnings = [];
+      const state = preAssignOffDays(totalDays);
+
+      const consecutiveWorkDays = EMPLOYEES.reduce((acc, emp) => {
+        acc[emp] = 0;
+        return acc;
+      }, {});
+
+      for (let d = 1; d <= totalDays; d++) {
+        const currentDate = new Date(startDate);
+        currentDate.setDate(startDate.getDate() + d - 1);
+        const dateStr = `${currentDate.getFullYear()}/${currentDate.getMonth() + 1}/${currentDate.getDate()}`;
+        let earlyCount = EMPLOYEES.filter(emp => schedule[emp][d] === SHIFT_TYPES.EARLY).length;
+        let lateCount = EMPLOYEES.filter(emp => schedule[emp][d] === SHIFT_TYPES.LATE).length;
+
+        EMPLOYEES.forEach(emp => {
+          if (schedule[emp][d] === SHIFT_TYPES.OFF) consecutiveWorkDays[emp] = 0;
+          else if (schedule[emp][d] === SHIFT_TYPES.EARLY || schedule[emp][d] === SHIFT_TYPES.LATE) consecutiveWorkDays[emp]++;
+        });
+
+        while (earlyCount < minEarly) {
+          const candidates = EMPLOYEES.filter(emp => {
+            const prevShift = d > 1 ? schedule[emp][d - 1] : '';
+            return schedule[emp][d] === '' && 
+                   getAllowedShifts(prevShift).includes(SHIFT_TYPES.EARLY) && 
+                   consecutiveWorkDays[emp] < 6;
+          }).sort((a, b) => {
+            const aPref = EMPLOYEE_PRIORITY[a]?.prefer === SHIFT_TYPES.EARLY ? -1 : 0;
+            const bPref = EMPLOYEE_PRIORITY[b]?.prefer === SHIFT_TYPES.EARLY ? -1 : 0;
+            return (aPref - bPref) || (state[a].totalWork - state[b].totalWork);
+          });
+          if (candidates.length > 0) {
+            const emp = candidates[0];
+            schedule[emp][d] = SHIFT_TYPES.EARLY;
+            state[emp].totalWork++;
+            consecutiveWorkDays[emp]++;
+            earlyCount++;
+          } else {
+            globalWarnings.push(`${dateStr} 無法安排足夠早班`);
+            break;
+          }
+        }
+
+        while (lateCount < minLate) {
+          const candidates = EMPLOYEES.filter(emp => {
+            const prevShift = d > 1 ? schedule[emp][d - 1] : '';
+            return schedule[emp][d] === '' && 
+                   getAllowedShifts(prevShift).includes(SHIFT_TYPES.LATE) && 
+                   consecutiveWorkDays[emp] < 6;
+          }).sort((a, b) => {
+            const aPref = EMPLOYEE_PRIORITY[a]?.prefer === SHIFT_TYPES.LATE ? -1 : 0;
+            const bPref = EMPLOYEE_PRIORITY[b]?.prefer === SHIFT_TYPES.LATE ? -1 : 0;
+            return (aPref - bPref) || (state[a].totalWork - state[b].totalWork);
+          });
+          if (candidates.length > 0) {
+            const emp = candidates[0];
+            schedule[emp][d] = SHIFT_TYPES.LATE;
+            state[emp].totalWork++;
+            consecutiveWorkDays[emp]++;
+            lateCount++;
+          } else {
+            globalWarnings.push(`${dateStr} 無法安排足夠晚班`);
+            break;
+          }
+        }
+
+        EMPLOYEES.forEach(emp => {
+          if (schedule[emp][d] !== '') return;
+          const prevShift = d > 1 ? schedule[emp][d - 1] : '';
+          const allowed = getAllowedShifts(prevShift).filter(shift => shift === SHIFT_TYPES.EARLY || shift === SHIFT_TYPES.LATE);
+          if (allowed.length > 0 && consecutiveWorkDays[emp] < 6) {
+            let shift = allowed.includes(SHIFT_TYPES.EARLY) && earlyCount <= lateCount ? SHIFT_TYPES.EARLY : SHIFT_TYPES.LATE;
+            schedule[emp][d] = shift;
+            state[emp].totalWork++;
+            consecutiveWorkDays[emp]++;
+            if (shift === SHIFT_TYPES.EARLY) earlyCount++;
+            else lateCount++;
+          } else {
+            schedule[emp][d] = SHIFT_TYPES.OFF;
+            consecutiveWorkDays[emp] = 0;
+          }
+        });
+      }
+      validateSchedule(totalDays, globalWarnings);
+      renderCalendar(totalDays);
+      saveState();
+    }
+
+    function validateSchedule(totalDays, warnings) {
+      const weeks = parseInt(document.getElementById('weeks').value);
+      const minEarly = parseInt(document.getElementById('minEarly').value);
+      const minLate = parseInt(document.getElementById('minLate').value);
+      for (let d = 1; d <= totalDays; d++) {
+        const currentDate = new Date(startDate);
+        currentDate.setDate(startDate.getDate() + d - 1);
+        const dateStr = `${currentDate.getFullYear()}/${currentDate.getMonth() + 1}/${currentDate.getDate()}`;
+        const earlies = EMPLOYEES.filter(emp => schedule[emp][d] === SHIFT_TYPES.EARLY).length;
+        const lates = EMPLOYEES.filter(emp => schedule[emp][d] === SHIFT_TYPES.LATE).length;
+        if (earlies < minEarly) warnings.push(`${dateStr} 缺少早班（需${minEarly}人，現${earlies}人）`);
+        if (lates < minLate) warnings.push(`${dateStr} 缺少晚班（需${minLate}人，現${lates}人）`);
+      }
+      EMPLOYEES.forEach(emp => {
+        let consecutive = 0;
+        for (let d = 1; d <= totalDays; d++) {
+          consecutive = schedule[emp][d] === SHIFT_TYPES.OFF ? 0 : consecutive + 1;
+          if (consecutive > 6) {
+            const startWorkDate = new Date(startDate);
+            startWorkDate.setDate(startDate.getDate() + d - consecutive);
+            warnings.push(`${emp} 從 ${startWorkDate.getFullYear()}/${startWorkDate.getMonth() + 1}/${startWorkDate.getDate()} 起連續工作超過6天`);
+          }
+          if (d > 1 && schedule[emp][d - 1] === SHIFT_TYPES.LATE && schedule[emp][d] === SHIFT_TYPES.EARLY) {
+            const lateDate = new Date(startDate);
+            lateDate.setDate(startDate.getDate() + d - 2);
+            warnings.push(`${emp} 在 ${lateDate.getFullYear()}/${lateDate.getMonth() + 1}/${lateDate.getDate()} 的晚班後接早班`);
+          }
+          if (d > 1 && schedule[emp][d - 1] === SHIFT_TYPES.NIGHT && ![SHIFT_TYPES.OFF, SHIFT_TYPES.NIGHT].includes(schedule[emp][d])) {
+            const nightDate = new Date(startDate);
+            nightDate.setDate(startDate.getDate() + d - 2);
+            warnings.push(`${emp} 在 ${nightDate.getFullYear()}/${nightDate.getMonth() + 1}/${nightDate.getDate()} 的夜班後接非休或夜班`);
+          }
+        }
+      });
+      EMPLOYEES.forEach(emp => {
+        for (let w = 0; w < weeks; w++) {
+          const weekStart = w * 7 + 1;
+          const weekEnd = Math.min(weekStart + 6, totalDays);
+          const offDays = Array.from({length: weekEnd - weekStart + 1}, (_, i) => weekStart + i)
+            .filter(d => schedule[emp][d] === SHIFT_TYPES.OFF).length;
+          if (offDays < 2) {
+            const weekStartDate = new Date(startDate);
+            weekStartDate.setDate(startDate.getDate() + weekStart - 1);
+            warnings.push(`${emp} 在第 ${w + 1} 週（從 ${weekStartDate.getMonth() + 1}/${weekStartDate.getDate()} 開始）僅有 ${offDays} 天休假`);
+          }
+        }
+      });
+    }
+
+    function showShiftTooltip(event, emp, day) {
+      let tooltip = document.querySelector('.tooltip');
+      if (!tooltip) {
+        tooltip = document.createElement('div');
+        tooltip.className = 'tooltip';
+        document.body.appendChild(tooltip);
+      }
+      const consecutive = countConsecutiveWork(emp, day);
+      tooltip.textContent = `連續工作: ${consecutive} 天`;
+      tooltip.style.left = `${event.pageX + 10}px`;
+      tooltip.style.top = `${event.pageY + 10}px`;
+      tooltip.style.display = 'block';
+      event.target.addEventListener('mouseout', () => tooltip.style.display = 'none', { once: true });
+    }
+
+    function countConsecutiveWork(emp, day) {
+      let count = 0;
+      for (let d = day; d >= 1; d--) {
+        if (schedule[emp][d] === SHIFT_TYPES.OFF) break;
+        count++;
+      }
+      return count;
+    }
+
+    function exportToExcel() {
+      const totalDays = schedule[EMPLOYEES[0]].length - 1;
+      const year = document.getElementById('year').value;
+      const month = document.getElementById('month').value;
+      const wsData = [["員工"].concat(Array.from({length: totalDays}, (_, i) => {
+        const date = new Date(startDate);
+        date.setDate(startDate.getDate() + i);
+        return `${date.getMonth() + 1}/${date.getDate()}`;
+      }))];
+      EMPLOYEES.forEach(emp => {
+        wsData.push([emp].concat(schedule[emp].slice(1).map(formatExportShift)));
+      });
+      const ws = XLSX.utils.aoa_to_sheet(wsData);
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, "排班表");
+      XLSX.writeFile(wb, `${year}年${month}月排班表.xlsx`);
+    }
+
+    function importSchedule(event) {
+      const file = event.target.files[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = function(e) {
+        const data = new Uint8Array(e.target.result);
+        const workbook = XLSX.read(data, { type: 'array' });
+        const sheetName = workbook.SheetNames[0];
+        const worksheet = workbook.Sheets[sheetName];
+        const jsonData = XLSX.utils.sheet_to_json(worksheet, { header: 1 });
+        const totalDays = jsonData[0].length - 1;
+        schedule = {};
+        EMPLOYEES.forEach((emp, index) => {
+          const row = jsonData[index + 1];
+          if (row && row[0] === emp) {
+            schedule[emp] = [''].concat(row.slice(1).map(shift => {
+              if (shift === '早班') return SHIFT_TYPES.EARLY;
+              if (shift === '晚班') return SHIFT_TYPES.LATE;
+              if (shift === '休假') return SHIFT_TYPES.OFF;
+              if (shift === '夜班') return SHIFT_TYPES.NIGHT;
+              return '';
+            }));
+          } else {
+            schedule[emp] = Array(totalDays + 1).fill('');
+          }
+        });
+        renderCalendar(totalDays);
+        saveState();
+      };
+      reader.readAsArrayBuffer(file);
+    }
+
+    function updateDashboard() {
+      const totalDays = schedule[EMPLOYEES[0]].length - 1;
+      const earlyData = Array(totalDays).fill(0);
+      const lateData = Array(totalDays).fill(0);
+      const nightData = Array(totalDays).fill(0);
+      const offData = Array(totalDays).fill(0);
+      
+      // 計算每一天的班次數據
+      EMPLOYEES.forEach(emp => {
+        for (let d = 1; d <= totalDays; d++) {
+          if (schedule[emp][d] === SHIFT_TYPES.EARLY) earlyData[d - 1]++;
+          if (schedule[emp][d] === SHIFT_TYPES.LATE) lateData[d - 1]++;
+          if (schedule[emp][d] === SHIFT_TYPES.NIGHT) nightData[d - 1]++;
+          if (schedule[emp][d] === SHIFT_TYPES.OFF) offData[d - 1]++;
+        }
+      });
+
+      // 計算日期映射
+      const dateLabels = Array.from({length: totalDays}, (_, i) => {
+        const date = new Date(startDate);
+        date.setDate(startDate.getDate() + i);
+        return `${date.getMonth() + 1}/${date.getDate()}`;
+      });
+
+      if (shiftChart) shiftChart.destroy();
+      const ctx = document.getElementById('shiftChart').getContext('2d');
+      shiftChart = new Chart(ctx, {
+        type: 'bar',
+        data: {
+          labels: Array.from({length: totalDays}, (_, i) => `${i + 1}`), // X 軸仍顯示流水號
+          datasets: [
+            { label: '早班', data: earlyData, backgroundColor: '#a3d8ff' },
+            { label: '晚班', data: lateData, backgroundColor: '#ffe08c' },
+            { label: '夜班', data: nightData, backgroundColor: '#6b7280' },
+            { label: '休假', data: offData, backgroundColor: '#ffb3ba' }
+          ]
+        },
+        options: {
+          scales: {
+            x: { stacked: true },
+            y: { stacked: true }
+          },
+          plugins: {
+            tooltip: {
+              callbacks: {
+                title: function(tooltipItems) {
+                  // 根據索引顯示對應日期
+                  const index = tooltipItems[0].dataIndex;
+                  return dateLabels[index]; // 顯示日期，例如 "2/1"
+                }
+              }
+            }
+          }
+        }
+      });
+
+      let statsHtml = '<tr><th>員工</th><th>早班</th><th>晚班</th><th>夜班</th><th>休假</th><th>總工時</th></tr>';
+      EMPLOYEES.forEach(emp => {
+        const early = schedule[emp].slice(1).filter(s => s === SHIFT_TYPES.EARLY).length;
+        const late = schedule[emp].slice(1).filter(s => s === SHIFT_TYPES.LATE).length;
+        const night = schedule[emp].slice(1).filter(s => s === SHIFT_TYPES.NIGHT).length;
+        const off = schedule[emp].slice(1).filter(s => s === SHIFT_TYPES.OFF).length;
+        const total = early + late + night;
+        statsHtml += `<tr><td>${emp}</td><td>${early}</td><td>${late}</td><td>${night}</td><td>${off}</td><td>${total}</td></tr>`;
+      });
+      document.getElementById('employeeStats').innerHTML = statsHtml;
+    }
+
+    function saveState() {
+      localStorage.setItem('scheduleData', JSON.stringify(schedule));
+      localStorage.setItem('systemConfig', JSON.stringify({
+        year: document.getElementById('year').value,
+        month: document.getElementById('month').value,
+        weeks: document.getElementById('weeks').value
+      }));
+      localStorage.setItem('employeePriority', JSON.stringify(EMPLOYEE_PRIORITY));
+    }
+
+    function getShiftClass(shift) {
+      if (shift === SHIFT_TYPES.EARLY) return 'early';
+      if (shift === SHIFT_TYPES.LATE) return 'late';
+      if (shift === SHIFT_TYPES.NIGHT) return 'night';
+      if (shift === SHIFT_TYPES.OFF) return 'off';
+      return '';
+    }
+
+    function formatShift(shift) {
+      return shift || '';
+    }
+
+    function formatExportShift(shift) {
+      if (shift === SHIFT_TYPES.EARLY) return '早班';
+      if (shift === SHIFT_TYPES.LATE) return '晚班';
+      if (shift === SHIFT_TYPES.NIGHT) return '夜班';
+      if (shift === SHIFT_TYPES.OFF) return '休假';
+      return '';
+    }
+
+    function showWarnings(warnings) {
+      document.getElementById('warnings').innerHTML = warnings.length ? `<div class="warning">${warnings.join('<br>')}</div>` : '';
+    }
+
+    function resetAll() {
+      weekOffset = 0;
+      localStorage.clear();
+      globalWarnings = [];
+      generateSchedule();
+    }
+
+    function togglePrioritySettings() {
+      const panel = document.getElementById('prioritySettings');
+      if (panel.style.display === 'none' || panel.style.display === '') {
+        renderPriorityTable();
+        panel.style.display = 'block';
+      } else {
+        panel.style.display = 'none';
+      }
+    }
+
+    function renderPriorityTable() {
+      const tbody = document.querySelector('#priorityTable tbody');
+      tbody.innerHTML = '';
+      EMPLOYEES.forEach(emp => {
+        const priority = EMPLOYEE_PRIORITY[emp];
+        tbody.innerHTML += `
+          <tr>
+            <td>${emp}</td>
+            <td><input type="number" id="maxShifts_${emp}" value="${priority.maxShifts}" min="0" style="width: 60px;"></td>
+            <td>
+              <select id="prefer_${emp}">
+                <option value="" ${priority.prefer === '' ? 'selected' : ''}>無偏好</option>
+                <option value="${SHIFT_TYPES.EARLY}" ${priority.prefer === SHIFT_TYPES.EARLY ? 'selected' : ''}>早班</option>
+                <option value="${SHIFT_TYPES.LATE}" ${priority.prefer === SHIFT_TYPES.LATE ? 'selected' : ''}>晚班</option>
+              </select>
+            </td>
+          </tr>
+        `;
+      });
+    }
+
+    function savePrioritySettings() {
+      EMPLOYEES.forEach(emp => {
+        EMPLOYEE_PRIORITY[emp] = {
+          maxShifts: parseInt(document.getElementById(`maxShifts_${emp}`).value) || 20,
+          prefer: document.getElementById(`prefer_${emp}`).value
+        };
+      });
+      togglePrioritySettings();
+      saveState();
+    }
+
+    generateSchedule();
+  </script>
+</body>
+</html>
