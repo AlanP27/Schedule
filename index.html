@@ -509,7 +509,7 @@
         }
       });
 
-      let statsHtml = '<tr><th>員工</th><th>早班</th><th>晚班</th><th>夜班</th><th>休假</th><th>總工時</th></tr>';
+      let statsHtml = '<tr><th>員工</th><th>早班</th><th>晚班</th><th>夜班</th><th>休假</th><th>總出勤天數</th></tr>';
       EMPLOYEES.forEach(emp => {
         const early = schedule[emp].slice(1).filter(s => s === SHIFT_TYPES.EARLY).length;
         const late = schedule[emp].slice(1).filter(s => s === SHIFT_TYPES.LATE).length;
