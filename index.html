@@ -203,6 +203,7 @@
       }, {});
 
       EMPLOYEES.forEach(emp => {
+        // 先計算每週因夜班導致的強制休假
         const mandatoryOffDays = new Map();
         for (let d = 1; d < totalDays; d++) {
           if (schedule[emp][d] === SHIFT_TYPES.NIGHT) {
@@ -210,18 +211,22 @@
             const nextDay = d + 1;
             if (schedule[emp][nextDay] === '' || ![SHIFT_TYPES.NIGHT].includes(schedule[emp][nextDay])) {
               mandatoryOffDays.set(week, (mandatoryOffDays.get(week) || 0) + 1);
+              // 預設將夜班後一天設為休假
+              if (schedule[emp][nextDay] === '') {
+                schedule[emp][nextDay] = SHIFT_TYPES.OFF;
+              }
             }
           }
         }
 
+        // 分配每週休假，考慮夜班後的強制休假
         for (let w = 0; w < weeks; w++) {
           const weekStart = w * 7 + 1;
           const weekEnd = Math.min(weekStart + 6, totalDays);
+          // 計算該週已有的休假天數（包括手動設定的休假和夜班後的強制休假）
           const preAssignedOff = Array.from({length: weekEnd - weekStart + 1}, (_, i) => weekStart + i)
             .filter(d => schedule[emp][d] === SHIFT_TYPES.OFF).length;
-          const mandatoryOff = mandatoryOffDays.get(w + 1) || 0;
-          const totalOff = preAssignedOff + mandatoryOff;
-          const offToAssign = Math.max(2 - totalOff, 0);
+          const offToAssign = Math.max(2 - preAssignedOff, 0); // 確保總休假天數為 2 天
           const availableDays = Array.from({length: weekEnd - weekStart + 1}, (_, i) => weekStart + i)
             .filter(d => schedule[emp][d] === '' && (d === 1 || schedule[emp][d - 1] !== SHIFT_TYPES.NIGHT));
           let offCount = 0;
@@ -236,6 +241,45 @@
         }
       });
       return state;
+    }
+
+    function balanceOffDays(totalDays) {
+      const weeks = parseInt(document.getElementById('weeks').value);
+      EMPLOYEES.forEach(emp => {
+        for (let w = 0; w < weeks; w++) {
+          const weekStart = w * 7 + 1;
+          const weekEnd = Math.min(weekStart + 6, totalDays);
+          // 計算該週的休假天數
+          const offDays = Array.from({length: weekEnd - weekStart + 1}, (_, i) => weekStart + i)
+            .filter(d => schedule[emp][d] === SHIFT_TYPES.OFF).length;
+          
+          if (offDays > 2) {
+            // 若休假天數超過 2 天，嘗試將多餘的「休」改為「早」或「晚」
+            const daysToAdjust = offDays - 2;
+            let adjusted = 0;
+            const daysInWeek = Array.from({length: weekEnd - weekStart + 1}, (_, i) => weekStart + i);
+            // 隨機打亂天數，避免總是調整固定的天
+            for (let i = daysInWeek.length - 1; i > 0; i--) {
+              const j = Math.floor(Math.random() * (i + 1));
+              [daysInWeek[i], daysInWeek[j]] = [daysInWeek[j], daysInWeek[i]];
+            }
+            for (let d of daysInWeek) {
+              if (adjusted >= daysToAdjust) break;
+              if (schedule[emp][d] !== SHIFT_TYPES.OFF) continue;
+              const prevShift = d > 1 ? schedule[emp][d - 1] : '';
+              const allowed = getAllowedShifts(prevShift).filter(shift => shift === SHIFT_TYPES.EARLY || shift === SHIFT_TYPES.LATE);
+              if (allowed.length > 0) {
+                // 計算當天的早班和晚班數量，選擇較少的一方
+                const earlyCount = EMPLOYEES.filter(e => schedule[e][d] === SHIFT_TYPES.EARLY).length;
+                const lateCount = EMPLOYEES.filter(e => schedule[e][d] === SHIFT_TYPES.LATE).length;
+                let shift = allowed.includes(SHIFT_TYPES.EARLY) && earlyCount <= lateCount ? SHIFT_TYPES.EARLY : SHIFT_TYPES.LATE;
+                schedule[emp][d] = shift;
+                adjusted++;
+              }
+            }
+          }
+        }
+      });
     }
 
     function autoFill() {
@@ -325,6 +369,10 @@
           }
         });
       }
+
+      // 平衡休假天數，確保每週休假天數為 2 天
+      balanceOffDays(totalDays);
+
       validateSchedule(totalDays, globalWarnings);
       renderCalendar(totalDays);
       saveState();
@@ -374,6 +422,11 @@
             const weekStartDate = new Date(startDate);
             weekStartDate.setDate(startDate.getDate() + weekStart - 1);
             warnings.push(`${emp} 在第 ${w + 1} 週（從 ${weekStartDate.getMonth() + 1}/${weekStartDate.getDate()} 開始）僅有 ${offDays} 天休假`);
+          }
+          if (offDays > 2) {
+            const weekStartDate = new Date(startDate);
+            weekStartDate.setDate(startDate.getDate() + weekStart - 1);
+            warnings.push(`${emp} 在第 ${w + 1} 週（從 ${weekStartDate.getMonth() + 1}/${weekStartDate.getDate()} 開始）有 ${offDays} 天休假，超過 2 天`);
           }
         }
       });
@@ -460,7 +513,6 @@
       const nightData = Array(totalDays).fill(0);
       const offData = Array(totalDays).fill(0);
       
-      // 計算每一天的班次數據
       EMPLOYEES.forEach(emp => {
         for (let d = 1; d <= totalDays; d++) {
           if (schedule[emp][d] === SHIFT_TYPES.EARLY) earlyData[d - 1]++;
@@ -470,7 +522,6 @@
         }
       });
 
-      // 計算日期映射
       const dateLabels = Array.from({length: totalDays}, (_, i) => {
         const date = new Date(startDate);
         date.setDate(startDate.getDate() + i);
@@ -482,7 +533,7 @@
       shiftChart = new Chart(ctx, {
         type: 'bar',
         data: {
-          labels: Array.from({length: totalDays}, (_, i) => `${i + 1}`), // X 軸仍顯示流水號
+          labels: Array.from({length: totalDays}, (_, i) => `${i + 1}`),
           datasets: [
             { label: '早班', data: earlyData, backgroundColor: '#a3d8ff' },
             { label: '晚班', data: lateData, backgroundColor: '#ffe08c' },
@@ -499,9 +550,8 @@
             tooltip: {
               callbacks: {
                 title: function(tooltipItems) {
-                  // 根據索引顯示對應日期
                   const index = tooltipItems[0].dataIndex;
-                  return dateLabels[index]; // 顯示日期，例如 "2/1"
+                  return dateLabels[index];
                 }
               }
             }
