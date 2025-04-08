@@ -84,6 +84,7 @@
       "賴柏仁": { maxShifts: 22, prefer: '' }
     };
     let schedule = {};
+    let manualOffDays = {}; // 記錄手動設定的休假
     let weekOffset = 0;
     let startDate;
     let shiftChart;
@@ -115,9 +116,11 @@
       const savedData = localStorage.getItem('scheduleData');
       const savedConfig = JSON.parse(localStorage.getItem('systemConfig') || '{}');
       const savedPriority = localStorage.getItem('employeePriority');
+      const savedManualOffDays = localStorage.getItem('manualOffDays');
 
       if (savedData && savedConfig && savedConfig.year === year && savedConfig.month === month + 1 && savedConfig.weeks === weeks) {
         if (savedPriority) EMPLOYEE_PRIORITY = JSON.parse(savedPriority);
+        if (savedManualOffDays) manualOffDays = JSON.parse(savedManualOffDays);
         schedule = JSON.parse(savedData);
         startDate = new Date(year, month, 1);
         startDate.setDate(startDate.getDate() - startDate.getDay() + weekOffset * 7);
@@ -133,7 +136,11 @@
       const totalDays = weeks * 7;
       document.getElementById('monthTitle').textContent = `${year}年${month + 1}月排班表 (共${totalDays}天，從${startDate.getMonth() + 1}/${startDate.getDate()}開始)`;
       schedule = {};
-      EMPLOYEES.forEach(emp => schedule[emp] = Array(totalDays + 1).fill(''));
+      manualOffDays = {};
+      EMPLOYEES.forEach(emp => {
+        schedule[emp] = Array(totalDays + 1).fill('');
+        manualOffDays[emp] = new Set();
+      });
       renderCalendar(totalDays);
       saveState();
     }
@@ -177,7 +184,14 @@
       while (!allowedShifts.includes(SHIFT_ORDER[nextIndex]) && nextIndex !== SHIFT_ORDER.indexOf(current)) {
         nextIndex = (nextIndex + 1) % SHIFT_ORDER.length;
       }
-      schedule[emp][day] = SHIFT_ORDER[nextIndex];
+      const newShift = SHIFT_ORDER[nextIndex];
+      schedule[emp][day] = newShift;
+      // 記錄手動設定的休假
+      if (newShift === SHIFT_TYPES.OFF) {
+        manualOffDays[emp].add(day);
+      } else {
+        manualOffDays[emp].delete(day);
+      }
       renderCalendar(schedule[EMPLOYEES[0]].length - 1);
       const totalDays = schedule[EMPLOYEES[0]].length - 1;
       globalWarnings = [];
@@ -188,6 +202,7 @@
     function clearShift(event, emp, day) {
       event.preventDefault();
       schedule[emp][day] = '';
+      manualOffDays[emp].delete(day); // 清除時移除手動休假記錄
       renderCalendar(schedule[EMPLOYEES[0]].length - 1);
       const totalDays = schedule[EMPLOYEES[0]].length - 1;
       globalWarnings = [];
@@ -211,7 +226,7 @@
             const nextDay = d + 1;
             if (schedule[emp][nextDay] === '' || ![SHIFT_TYPES.NIGHT].includes(schedule[emp][nextDay])) {
               mandatoryOffDays.set(week, (mandatoryOffDays.get(week) || 0) + 1);
-              // 預設將夜班後一天設為休假
+              // 預設將夜班後一天設為休假，但不覆蓋手動設定的班次
               if (schedule[emp][nextDay] === '') {
                 schedule[emp][nextDay] = SHIFT_TYPES.OFF;
               }
@@ -219,7 +234,7 @@
           }
         }
 
-        // 分配每週休假，考慮夜班後的強制休假
+        // 分配每週休假，考慮手動設定的休假和夜班後的強制休假
         for (let w = 0; w < weeks; w++) {
           const weekStart = w * 7 + 1;
           const weekEnd = Math.min(weekStart + 6, totalDays);
@@ -254,7 +269,7 @@
             .filter(d => schedule[emp][d] === SHIFT_TYPES.OFF).length;
           
           if (offDays > 2) {
-            // 若休假天數超過 2 天，嘗試將多餘的「休」改為「早」或「晚」
+            // 若休假天數超過 2 天，嘗試將非手動設定的「休」改為「早」或「晚」
             const daysToAdjust = offDays - 2;
             let adjusted = 0;
             const daysInWeek = Array.from({length: weekEnd - weekStart + 1}, (_, i) => weekStart + i);
@@ -266,6 +281,8 @@
             for (let d of daysInWeek) {
               if (adjusted >= daysToAdjust) break;
               if (schedule[emp][d] !== SHIFT_TYPES.OFF) continue;
+              // 跳過手動設定的休假
+              if (manualOffDays[emp].has(d)) continue;
               const prevShift = d > 1 ? schedule[emp][d - 1] : '';
               const allowed = getAllowedShifts(prevShift).filter(shift => shift === SHIFT_TYPES.EARLY || shift === SHIFT_TYPES.LATE);
               if (allowed.length > 0) {
@@ -370,7 +387,7 @@
         });
       }
 
-      // 平衡休假天數，確保每週休假天數為 2 天
+      // 平衡休假天數，確保每週休假天數為 2 天，但不更改手動設定的休假
       balanceOffDays(totalDays);
 
       validateSchedule(totalDays, globalWarnings);
@@ -418,6 +435,8 @@
           const weekEnd = Math.min(weekStart + 6, totalDays);
           const offDays = Array.from({length: weekEnd - weekStart + 1}, (_, i) => weekStart + i)
             .filter(d => schedule[emp][d] === SHIFT_TYPES.OFF).length;
+          const manualOffCount = Array.from({length: weekEnd - weekStart + 1}, (_, i) => weekStart + i)
+            .filter(d => manualOffDays[emp].has(d)).length;
           if (offDays < 2) {
             const weekStartDate = new Date(startDate);
             weekStartDate.setDate(startDate.getDate() + weekStart - 1);
@@ -426,7 +445,7 @@
           if (offDays > 2) {
             const weekStartDate = new Date(startDate);
             weekStartDate.setDate(startDate.getDate() + weekStart - 1);
-            warnings.push(`${emp} 在第 ${w + 1} 週（從 ${weekStartDate.getMonth() + 1}/${weekStartDate.getDate()} 開始）有 ${offDays} 天休假，超過 2 天`);
+            warnings.push(`${emp} 在第 ${w + 1} 週（從 ${weekStartDate.getMonth() + 1}/${weekStartDate.getDate()} 開始）有 ${offDays} 天休假，超過 2 天（其中 ${manualOffCount} 天為手動設定）`);
           }
         }
       });
@@ -486,6 +505,7 @@
         const jsonData = XLSX.utils.sheet_to_json(worksheet, { header: 1 });
         const totalDays = jsonData[0].length - 1;
         schedule = {};
+        manualOffDays = {};
         EMPLOYEES.forEach((emp, index) => {
           const row = jsonData[index + 1];
           if (row && row[0] === emp) {
@@ -496,8 +516,16 @@
               if (shift === '夜班') return SHIFT_TYPES.NIGHT;
               return '';
             }));
+            manualOffDays[emp] = new Set();
+            // 將匯入的休假視為手動設定
+            schedule[emp].forEach((shift, day) => {
+              if (shift === SHIFT_TYPES.OFF && day > 0) {
+                manualOffDays[emp].add(day);
+              }
+            });
           } else {
             schedule[emp] = Array(totalDays + 1).fill('');
+            manualOffDays[emp] = new Set();
           }
         });
         renderCalendar(totalDays);
@@ -579,6 +607,7 @@
         weeks: document.getElementById('weeks').value
       }));
       localStorage.setItem('employeePriority', JSON.stringify(EMPLOYEE_PRIORITY));
+      localStorage.setItem('manualOffDays', JSON.stringify(manualOffDays));
     }
 
     function getShiftClass(shift) {
@@ -609,6 +638,7 @@
       weekOffset = 0;
       localStorage.clear();
       globalWarnings = [];
+      manualOffDays = {}; // 清空手動休假記錄
       generateSchedule();
     }
 
